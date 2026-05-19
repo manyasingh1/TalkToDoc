@@ -20,6 +20,7 @@ collection = db.get_collection(
     name="multimodal_docs"
 )
 
+
 while True:
 
     question = input("\nAsk: ")
@@ -49,6 +50,11 @@ while True:
         results["documents"][0]
     )
 
+    print("\nRetrieved chunks:")
+    print("="*50)
+    print(context[:1000])   # first 1000 chars only
+    print("="*50)
+
 
     prompt = f"""
 Use only the context below.
@@ -66,5 +72,6 @@ Question:
         contents=prompt
     )
 
-    print("\nAnswer:\n")
+
+    print("\nAnswer:")
     print(response.text)
