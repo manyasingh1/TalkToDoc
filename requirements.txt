@@ -1,0 +1,6 @@
+docling
+chromadb
+ollama
+google-cloud-storage
+pillow
+python-dotenv

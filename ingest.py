@@ -1,313 +1,221 @@
 import os
 import io
-from dotenv import load_dotenv
+import base64
+import ollama
 import chromadb
-
-from google import genai
-from google.genai import types
-
-from PIL import Image
-
-from docling.document_converter import (
-    DocumentConverter,
-    PdfFormatOption
-)
-
+from google.cloud import storage
+from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.datamodel.base_models import InputFormat
 from docling.chunking import HybridChunker
 
-
 # ==========================
-# Load API key
-# ==========================
-
-load_dotenv()
-
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
-
-
-# ==========================
-# Create/Open ChromaDB
+# Config — UPDATE THIS
 # ==========================
 
-db = chromadb.PersistentClient(
-    path="./chroma_db"
-)
-
-collection = db.get_or_create_collection(
-    name="multimodal_docs"
-)
-
+GCS_BUCKET  = "ragproj-chromadb"   # ← your actual GCS bucket name
+LOCAL_DB    = "./chroma_db"
+DATA_FOLDER = "./data"
 
 # ==========================
-# Existing IDs
+# ChromaDB (local on VM)
 # ==========================
 
-existing = collection.get()
-
-existing_ids = set(
-    existing["ids"]
-)
-
+db = chromadb.PersistentClient(path=LOCAL_DB)
+collection = db.get_or_create_collection(name="multimodal_docs")
+existing_ids = set(collection.get()["ids"])
 
 # ==========================
-# Image description function
+# Image Filter
+# ==========================
+
+def is_useful_image(pil_img):
+    w, h = pil_img.size
+    if w < 100 or h < 100:
+        return False
+    aspect = w / h
+    if aspect > 10 or aspect < 0.1:
+        return False
+    if w * h < 20000:
+        return False
+    return True
+
+# ==========================
+# Image Description (LLaVA)
 # ==========================
 
 def describe_image(pil_img):
-
     try:
-
-        buffer = io.BytesIO()
-
-        pil_img.save(
-            buffer,
-            format="PNG"
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        response = ollama.chat(
+            model="llava",
+            messages=[{
+                "role": "user",
+                "content": """Analyze this image from a PDF. Return:
+1. Main topic
+2. Visible text and labels
+3. Objects or diagrams present
+4. Graph or chart data if applicable
+5. Technical meaning
+6. Summary for semantic retrieval
+Be specific and structured.""",
+                "images": [image_b64]
+            }]
         )
-
-        image_bytes = buffer.getvalue()
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-
-            contents=[
-
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/png"
-                ),
-
-                "Describe this image in detail including diagrams, labels, objects, charts and meaning."
-            ]
-        )
-
-        return response.text
-
+        return response["message"]["content"]
     except Exception as e:
-
-        print(
-            "Image processing error:",
-            e
-        )
-
+        print("Image error:", e)
         return None
 
+# ==========================
+# Embedding (nomic-embed-text)
+# ==========================
+
+def embed_text(text):
+    response = ollama.embeddings(
+        model="nomic-embed-text",
+        prompt=text
+    )
+    return response["embedding"]
 
 # ==========================
-# Docling settings
+# Docling Setup
 # ==========================
 
 pipeline_options = PdfPipelineOptions()
-
-pipeline_options.do_ocr = False
-
+pipeline_options.do_ocr = True
+pipeline_options.generate_picture_images = True
+pipeline_options.images_scale = 2.0
 
 converter = DocumentConverter(
-
     format_options={
-
-        InputFormat.PDF:
-
-        PdfFormatOption(
+        InputFormat.PDF: PdfFormatOption(
             pipeline_options=pipeline_options
         )
     }
 )
 
-
 chunker = HybridChunker(
     tokenizer="sentence-transformers/all-MiniLM-L6-v2"
 )
-
 
 # ==========================
 # Process PDFs
 # ==========================
 
-pdf_folder = "data"
-
-
-for file in os.listdir(pdf_folder):
-
+for file in os.listdir(DATA_FOLDER):
     if not file.endswith(".pdf"):
         continue
-
-
     if any(file in x for x in existing_ids):
-
-        print(
-            f"Skipping {file}"
-        )
-
+        print(f"Skipping {file} (already indexed)")
         continue
 
-
-    print(
-        f"\nIndexing {file}"
-    )
-
-
-    pdf_path = os.path.join(
-        pdf_folder,
-        file
-    )
-
+    print(f"\nIndexing: {file}")
 
     try:
-
-        result = converter.convert(
-            pdf_path
-        )
-
+        result = converter.convert(os.path.join(DATA_FOLDER, file))
         doc = result.document
 
-
-        # ==========================
-        # IMAGE PROCESSING
-        # ==========================
-
+        # --- Images ---
         if hasattr(doc, "pictures"):
-
-            print(
-                "Checking images..."
-            )
-
             for pic_num, picture in enumerate(doc.pictures):
-
                 try:
+                    img_id = f"{file}_image_{pic_num}"
+                    if img_id in existing_ids:
+                        continue
+                    pil_img = picture.image.pil_image
+                    if pil_img is None:
+                        continue
+                    if not is_useful_image(pil_img):
+                        print(f"  Skipped image {pic_num} (decorative)")
+                        continue
 
-                    image = picture.image.pil_image
+                    os.makedirs("extracted_images", exist_ok=True)
+                    img_path = f"extracted_images/{file}_{pic_num}.png"
+                    pil_img.save(img_path)
 
+                    caption = ""
+                    if hasattr(picture, "captions") and picture.captions:
+                        caption = " ".join(
+                            c.text for c in picture.captions if hasattr(c, "text")
+                        )
 
-                    description = describe_image(
-                        image
+                    print(f"  Describing image {pic_num}...")
+                    description = describe_image(pil_img)
+                    if not description:
+                        continue
+
+                    page_no = -1
+                    if hasattr(picture, "prov") and picture.prov:
+                        page_no = picture.prov[0].page_no
+
+                    final_text = f"IMAGE DESCRIPTION:\n{description}\n\nCAPTION:\n{caption}"
+                    embedding = embed_text(final_text)
+
+                    collection.add(
+                        documents=[final_text],
+                        embeddings=[embedding],
+                        ids=[img_id],
+                        metadatas=[{
+                            "source": file,
+                            "type": "image",
+                            "page": page_no,
+                            "image_path": img_path
+                        }]
                     )
-
-
-                    if description:
-
-                        response = client.models.embed_content(
-
-                            model="gemini-embedding-001",
-
-                            contents=description,
-
-                            config=types.EmbedContentConfig(
-                                task_type="RETRIEVAL_DOCUMENT"
-                            )
-                        )
-
-
-                        collection.add(
-
-                            documents=[
-                                description
-                            ],
-
-                            embeddings=[
-                                response.embeddings[0].values
-                            ],
-
-                            ids=[
-                                f"{file}_image_{pic_num}"
-                            ],
-
-                            metadatas=[
-
-                                {
-                                    "source": file,
-                                    "type": "image"
-                                }
-
-                            ]
-                        )
-
-
-                        print(
-                            f"Image {pic_num} indexed"
-                        )
-
+                    print(f"  Image {pic_num} indexed (page {page_no})")
 
                 except Exception as e:
+                    print(f"  Image {pic_num} failed:", e)
 
-                    print(
-                        "Image failed:",
-                        e
-                    )
-
-
-        # ==========================
-        # TEXT PROCESSING
-        # ==========================
-
-        chunks = list(
-            chunker.chunk(doc)
-        )
-
-
-        for i, chunk in enumerate(chunks):
-
-            text = chunk.text
-
-
+        # --- Text Chunks ---
+        for i, chunk in enumerate(chunker.chunk(doc)):
+            chunk_id = f"{file}_{i}"
+            if chunk_id in existing_ids:
+                continue
+            text = chunk.text.strip()
+            if len(text) < 20:
+                continue
             try:
-
-                response = client.models.embed_content(
-
-                    model="gemini-embedding-001",
-
-                    contents=text,
-
-                    config=types.EmbedContentConfig(
-                        task_type="RETRIEVAL_DOCUMENT"
-                    )
-                )
-
-
+                embedding = embed_text(text)
                 collection.add(
-
-                    documents=[
-                        text
-                    ],
-
-                    embeddings=[
-                        response.embeddings[0].values
-                    ],
-
-                    ids=[
-                        f"{file}_{i}"
-                    ],
-
-                    metadatas=[
-
-                        {
-                            "source": file,
-                            "type": "text"
-                        }
-
-                    ]
+                    documents=[text],
+                    embeddings=[embedding],
+                    ids=[chunk_id],
+                    metadatas=[{
+                        "source": file,
+                        "type": "text",
+                        "chunk": i,
+                        "page": getattr(chunk.meta, "page_no", -1)
+                    }]
                 )
-
-
             except Exception as e:
+                print(f"  Chunk {i} failed:", e)
 
-                print(
-                    "Chunk failed:",
-                    e
-                )
-
+        print(f"Done: {file}")
 
     except Exception as e:
+        print(f"Error processing {file}:", e)
 
-        print(
-            f"Error in {file}:",
-            e
-        )
+print("\nIndexing complete.")
 
+# ==========================
+# Sync chroma_db → GCS
+# ==========================
 
-print(
-    "\nUpdate complete"
-)
+print("\nUploading chroma_db to Cloud Storage...")
+
+gcs = storage.Client()
+bucket = gcs.bucket(GCS_BUCKET)
+
+for root, dirs, files in os.walk(LOCAL_DB):
+    for fname in files:
+        local_path = os.path.join(root, fname)
+        gcs_path   = local_path.replace("\\", "/").lstrip("./")
+        blob       = bucket.blob(gcs_path)
+        blob.upload_from_filename(local_path)
+
+print(f"Synced to gs://{GCS_BUCKET}/")
+print("Done! Stop your VM now to save credits.")
