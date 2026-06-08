@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docling RAG Chatbot Dashboard</title>
+    <!-- Google Fonts: Outfit & Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Lucide Icons for premium iconography -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation and Control Panel -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-glow"></div>
+                <i data-lucide="bot" class="logo-icon"></i>
+                <h2>Docling <span>RAG</span></h2>
+            </div>
+
+            <!-- Status Indicator Panel -->
+            <section class="panel status-panel">
+                <h3><i data-lucide="activity"></i> System Status</h3>
+                <div class="status-grid">
+                    <div class="status-card">
+                        <span class="label">Chroma DB</span>
+                        <div class="value-container">
+                            <span id="db-chunk-count" class="value">0</span>
+                            <span class="sub-label">chunks</span>
+                        </div>
+                    </div>
+                    <div class="status-card">
+                        <span class="label">Gemini API</span>
+                        <div class="value-container">
+                            <span id="api-status" class="status-badge error">
+                                <span class="pulse-ring"></span>Disconnected
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Document Upload Panel -->
+            <section class="panel upload-panel">
+                <h3><i data-lucide="file-plus"></i> Add Document</h3>
+                <div id="drop-zone" class="drop-zone">
+                    <input type="file" id="file-input" accept=".pdf" style="display: none;">
+                    <i data-lucide="upload-cloud" class="upload-icon"></i>
+                    <p class="primary-text">Drag & drop PDF here</p>
+                    <p class="secondary-text">or click to browse files</p>
+                    <div id="upload-progress-bar" class="progress-bar-container" style="display: none;">
+                        <div class="progress-track">
+                            <div id="progress-fill" class="progress-fill"></div>
+                        </div>
+                        <span id="progress-status" class="progress-text">Uploading...</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Document Directory List -->
+            <section class="panel docs-panel">
+                <h3><i data-lucide="files"></i> Indexed Documents</h3>
+                <div id="docs-list" class="docs-list">
+                    <div class="empty-docs-state">
+                        <i data-lucide="file-warning"></i>
+                        <p>No documents uploaded yet</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Database Configuration / Actions Panel -->
+            <section class="panel actions-panel">
+                <h3><i data-lucide="sliders"></i> Database Actions</h3>
+                <div class="actions-buttons">
+                    <button id="btn-clear-docs" class="btn btn-secondary" title="Clear PDFs & Markdown files from local storage">
+                        <i data-lucide="folder-x"></i> Clear Local Files
+                    </button>
+                    <button id="btn-clear-chroma" class="btn btn-danger" title="Clear all collection chunks in Chroma DB">
+                        <i data-lucide="trash-2"></i> Reset Chroma DB
+                    </button>
+                </div>
+            </section>
+        </aside>
+
+        <!-- Main Chatbot Interface Area -->
+        <main class="chat-area">
+            <header class="chat-header">
+                <div class="chat-title-info">
+                    <h2>RAG Copilot</h2>
+                    <p id="chat-sub-info">Ask questions based on your indexed PDFs</p>
+                </div>
+                <div class="status-indicator">
+                    <span id="active-doc-badge" class="active-doc-badge">No Documents Active</span>
+                </div>
+            </header>
+
+            <!-- Chat Message Panel -->
+            <div id="chat-messages" class="chat-messages">
+                <!-- Welcome Message -->
+                <div class="message system-message">
+                    <div class="avatar"><i data-lucide="bot"></i></div>
+                    <div class="message-content">
+                        <p>Hello! I am your Docling-powered RAG assistant. Please upload one or more PDF files in the sidebar, and I'll chunk and index them into ChromaDB. Once indexed, you can ask me queries about the contents, and I'll answer using the relevant snippets!</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dynamic Source / Reference Preview Drawer -->
+            <div id="source-drawer" class="source-drawer closed">
+                <div class="drawer-header">
+                    <h4><i data-lucide="bookmark-check"></i> Referenced Context Sources</h4>
+                    <button id="close-drawer-btn" class="icon-btn"><i data-lucide="x"></i></button>
+                </div>
+                <div id="source-list-content" class="source-list-content">
+                    <!-- Dynamic sources will load here -->
+                </div>
+            </div>
+
+            <!-- Query Input Bar -->
+            <footer class="chat-footer">
+                <form id="chat-form" class="chat-form">
+                    <div class="input-container">
+                        <textarea id="chat-input" placeholder="Type your query here..." rows="1" required></textarea>
+                        <button type="button" id="toggle-sources-btn" class="icon-btn tooltip" title="Toggle sources drawer">
+                            <i data-lucide="book-open"></i>
+                        </button>
+                        <button type="submit" id="send-btn" class="send-btn">
+                            <span>Send Query</span>
+                            <i data-lucide="send"></i>
+                        </button>
+                    </div>
+                </form>
+            </footer>
+        </main>
+    </div>
+
+    <!-- Alert Modal for confirms and warnings -->
+    <div id="alert-modal" class="modal-backdrop" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h4 id="modal-title">Confirm Action</h4>
+                <button class="modal-close"><i data-lucide="x"></i></button>
+            </div>
+            <div class="modal-body">
+                <p id="modal-message">Are you sure you want to perform this action?</p>
+            </div>
+            <div class="modal-footer">
+                <button id="modal-btn-cancel" class="btn btn-secondary">Cancel</button>
+                <button id="modal-btn-confirm" class="btn btn-danger">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Lucide icons on page load
+        document.addEventListener("DOMContentLoaded", () => {
+            lucide.createIcons();
+        });
+    </script>
+    <script src="app.js"></script>
+</body>
+</html>

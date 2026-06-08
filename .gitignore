@@ -1,0 +1,6 @@
+__pycache__/
+chromadb/
+data/
+extracted_images/
+.env
+query_cache.json
