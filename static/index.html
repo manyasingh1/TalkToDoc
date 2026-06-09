@@ -3,26 +3,23 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Docling RAG Chatbot Dashboard</title>
-    <!-- Google Fonts: Outfit & Inter -->
+    <title>TalkToDoc</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <!-- Lucide Icons for premium iconography -->
-    <script src="https://unpkg.com/lucide@latest"></script>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="app-container">
-        <!-- Sidebar Navigation and Control Panel -->
+        <!-- Sidebar -->
         <aside class="sidebar">
             <div class="brand">
                 <div class="logo-glow"></div>
                 <i data-lucide="bot" class="logo-icon"></i>
-                <h2>Docling <span>RAG</span></h2>
+                <h2><span>TalkToDoc</span></h2>
             </div>
 
-            <!-- Status Indicator Panel -->
+            <!-- Status Panel -->
             <section class="panel status-panel">
                 <h3><i data-lucide="activity"></i> System Status</h3>
                 <div class="status-grid">
@@ -44,7 +41,7 @@
                 </div>
             </section>
 
-            <!-- Document Upload Panel -->
+            <!-- Upload Panel -->
             <section class="panel upload-panel">
                 <h3><i data-lucide="file-plus"></i> Add Document</h3>
                 <div id="drop-zone" class="drop-zone">
@@ -61,7 +58,7 @@
                 </div>
             </section>
 
-            <!-- Document Directory List -->
+            <!-- Docs List -->
             <section class="panel docs-panel">
                 <h3><i data-lucide="files"></i> Indexed Documents</h3>
                 <div id="docs-list" class="docs-list">
@@ -72,7 +69,7 @@
                 </div>
             </section>
 
-            <!-- Database Configuration / Actions Panel -->
+            <!-- Actions Panel -->
             <section class="panel actions-panel">
                 <h3><i data-lucide="sliders"></i> Database Actions</h3>
                 <div class="actions-buttons">
@@ -86,48 +83,65 @@
             </section>
         </aside>
 
-        <!-- Main Chatbot Interface Area -->
+        <!-- Main Chat Area -->
         <main class="chat-area">
             <header class="chat-header">
                 <div class="chat-title-info">
                     <h2>RAG Copilot</h2>
                     <p id="chat-sub-info">Ask questions based on your indexed PDFs</p>
                 </div>
-                <div class="status-indicator">
+                <div class="chat-header-controls">
                     <span id="active-doc-badge" class="active-doc-badge">No Documents Active</span>
+                    <!-- Sources toggle -->
+                    <button type="button" id="toggle-sources-btn" class="icon-btn" title="Toggle sources drawer">
+                        <i data-lucide="book-open"></i>
+                    </button>
+                    <!-- Images toggle -->
+                    <button type="button" id="toggle-images-btn" class="icon-btn" title="Toggle extracted images">
+                        <i data-lucide="image"></i>
+                        <span id="images-btn-count" class="btn-image-count" style="display:none"></span>
+                    </button>
                 </div>
             </header>
 
-            <!-- Chat Message Panel -->
+            <!-- Chat Messages -->
             <div id="chat-messages" class="chat-messages">
-                <!-- Welcome Message -->
                 <div class="message system-message">
                     <div class="avatar"><i data-lucide="bot"></i></div>
                     <div class="message-content">
-                        <p>Hello! I am your Docling-powered RAG assistant. Please upload one or more PDF files in the sidebar, and I'll chunk and index them into ChromaDB. Once indexed, you can ask me queries about the contents, and I'll answer using the relevant snippets!</p>
+                        <p>Hello! I'm TalkToDoc — your Docling-powered RAG assistant. Upload one or more PDFs in the sidebar and I'll chunk and index them into ChromaDB. Once indexed, ask me anything about their contents!</p>
                     </div>
                 </div>
             </div>
 
-            <!-- Dynamic Source / Reference Preview Drawer -->
+            <!-- Sources Drawer (slides in from right) -->
             <div id="source-drawer" class="source-drawer closed">
                 <div class="drawer-header">
                     <h4><i data-lucide="bookmark-check"></i> Referenced Context Sources</h4>
                     <button id="close-drawer-btn" class="icon-btn"><i data-lucide="x"></i></button>
                 </div>
-                <div id="source-list-content" class="source-list-content">
-                    <!-- Dynamic sources will load here -->
+                <div id="source-list-content" class="source-list-content"></div>
+            </div>
+
+            <!-- Images Drawer — FIX: was "source-drawer closed", now "images-drawer closed" -->
+            <div id="images-drawer" class="images-drawer closed">
+                <div class="drawer-header">
+                    <h4><i data-lucide="image" style="color: var(--accent-violet);"></i> Extracted Images</h4>
+                    <button id="close-images-drawer-btn" class="icon-btn"><i data-lucide="x"></i></button>
+                </div>
+                <div id="images-drawer-content" class="images-drawer-content">
+                    <div class="empty-images-state">
+                        <i data-lucide="image-off"></i>
+                        <p>No images retrieved yet</p>
+                    </div>
                 </div>
             </div>
 
-            <!-- Query Input Bar -->
+            <!-- Chat Input Footer -->
             <footer class="chat-footer">
                 <form id="chat-form" class="chat-form">
                     <div class="input-container">
                         <textarea id="chat-input" placeholder="Type your query here..." rows="1" required></textarea>
-                        <button type="button" id="toggle-sources-btn" class="icon-btn tooltip" title="Toggle sources drawer">
-                            <i data-lucide="book-open"></i>
-                        </button>
                         <button type="submit" id="send-btn" class="send-btn">
                             <span>Send Query</span>
                             <i data-lucide="send"></i>
@@ -138,7 +152,7 @@
         </main>
     </div>
 
-    <!-- Alert Modal for confirms and warnings -->
+    <!-- Confirm Modal -->
     <div id="alert-modal" class="modal-backdrop" style="display: none;">
         <div class="modal">
             <div class="modal-header">
@@ -155,10 +169,10 @@
         </div>
     </div>
 
+    <script src="https://unpkg.com/lucide@0.383.0/dist/umd/lucide.min.js"></script>
     <script>
-        // Initialize Lucide icons on page load
         document.addEventListener("DOMContentLoaded", () => {
-            lucide.createIcons();
+            if (typeof lucide !== "undefined") lucide.createIcons();
         });
     </script>
     <script src="app.js"></script>

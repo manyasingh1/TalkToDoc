@@ -5,45 +5,53 @@ const state = {
     geminiActive: false,
     apiKeyConfigured: false,
     activeSources: [],
+    activeImagePaths: [],
     isUploading: false,
     isQuerying: false,
-    activeJobId: null,       // tracks current background upload job
-    jobPollInterval: null    // reference to polling interval so we can clear it
+    activeJobId: null,
+    jobPollInterval: null
 };
 
-// UI Elements
-const els = {
-    dbChunkCount: document.getElementById('db-chunk-count'),
-    apiStatus: document.getElementById('api-status'),
-    dropZone: document.getElementById('drop-zone'),
-    fileInput: document.getElementById('file-input'),
-    uploadProgressBar: document.getElementById('upload-progress-bar'),
-    progressFill: document.getElementById('progress-fill'),
-    progressStatus: document.getElementById('progress-status'),
-    docsList: document.getElementById('docs-list'),
-    btnClearDocs: document.getElementById('btn-clear-docs'),
-    btnClearChroma: document.getElementById('btn-clear-chroma'),
-    chatMessages: document.getElementById('chat-messages'),
-    chatForm: document.getElementById('chat-form'),
-    chatInput: document.getElementById('chat-input'),
-    sendBtn: document.getElementById('send-btn'),
-    activeDocBadge: document.getElementById('active-doc-badge'),
-    sourceDrawer: document.getElementById('source-drawer'),
-    closeDrawerBtn: document.getElementById('close-drawer-btn'),
-    toggleSourcesBtn: document.getElementById('toggle-sources-btn'),
-    sourceListContent: document.getElementById('source-list-content'),
-
-    // Modal Elements
-    alertModal: document.getElementById('alert-modal'),
-    modalTitle: document.getElementById('modal-title'),
-    modalMessage: document.getElementById('modal-message'),
-    modalCancel: document.getElementById('modal-btn-cancel'),
-    modalConfirm: document.getElementById('modal-btn-confirm'),
-    modalClose: document.querySelector('.modal-close')
-};
+// UI Elements (populated inside DOMContentLoaded so getElementById always finds real elements)
+const els = {};
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
+    Object.assign(els, {
+        dbChunkCount: document.getElementById('db-chunk-count'),
+        apiStatus: document.getElementById('api-status'),
+        dropZone: document.getElementById('drop-zone'),
+        fileInput: document.getElementById('file-input'),
+        uploadProgressBar: document.getElementById('upload-progress-bar'),
+        progressFill: document.getElementById('progress-fill'),
+        progressStatus: document.getElementById('progress-status'),
+        docsList: document.getElementById('docs-list'),
+        btnClearDocs: document.getElementById('btn-clear-docs'),
+        btnClearChroma: document.getElementById('btn-clear-chroma'),
+        chatMessages: document.getElementById('chat-messages'),
+        chatForm: document.getElementById('chat-form'),
+        chatInput: document.getElementById('chat-input'),
+        sendBtn: document.getElementById('send-btn'),
+        activeDocBadge: document.getElementById('active-doc-badge'),
+        // Sources drawer
+        sourceDrawer: document.getElementById('source-drawer'),
+        closeDrawerBtn: document.getElementById('close-drawer-btn'),
+        toggleSourcesBtn: document.getElementById('toggle-sources-btn'),
+        sourceListContent: document.getElementById('source-list-content'),
+        // Images drawer
+        imagesDrawer: document.getElementById('images-drawer'),
+        closeImagesDrawerBtn: document.getElementById('close-images-drawer-btn'),
+        toggleImagesBtn: document.getElementById('toggle-images-btn'),
+        imagesDrawerContent: document.getElementById('images-drawer-content'),
+        imagesBtnCount: document.getElementById('images-btn-count'),
+        // Modal
+        alertModal: document.getElementById('alert-modal'),
+        modalTitle: document.getElementById('modal-title'),
+        modalMessage: document.getElementById('modal-message'),
+        modalCancel: document.getElementById('modal-btn-cancel'),
+        modalConfirm: document.getElementById('modal-btn-confirm'),
+        modalClose: document.querySelector('.modal-close')
+    });
     fetchStatus();
     setupEventListeners();
     autoResizeTextarea();
@@ -113,7 +121,10 @@ function setupEventListeners() {
         );
     });
 
+    // Sources drawer toggle
     els.toggleSourcesBtn.addEventListener('click', () => {
+        els.imagesDrawer.classList.add('closed');
+        els.toggleImagesBtn.classList.remove('active-images');
         els.sourceDrawer.classList.toggle('closed');
         els.toggleSourcesBtn.classList.toggle('active');
     });
@@ -123,8 +134,28 @@ function setupEventListeners() {
         els.toggleSourcesBtn.classList.remove('active');
     });
 
+    // Images drawer toggle
+    els.toggleImagesBtn.addEventListener('click', () => {
+        if (!els.sourceDrawer.classList.contains('closed')) {
+            els.sourceDrawer.classList.add('closed');
+            els.toggleSourcesBtn.classList.remove('active');
+        }
+        els.imagesDrawer.classList.toggle('closed');
+        els.toggleImagesBtn.classList.toggle('active-images');
+    });
+
+    els.closeImagesDrawerBtn.addEventListener('click', () => {
+        els.imagesDrawer.classList.add('closed');
+        els.toggleImagesBtn.classList.remove('active-images');
+    });
+
+    // Modal listeners — all inside setupEventListeners so els is populated
     els.modalCancel.addEventListener('click', hideModal);
     els.modalClose.addEventListener('click', hideModal);
+    els.modalConfirm.addEventListener('click', () => {
+        if (activeConfirmCallback) activeConfirmCallback();
+        hideModal();
+    });
     els.alertModal.addEventListener('click', (e) => {
         if (e.target === els.alertModal) hideModal();
     });
@@ -187,7 +218,7 @@ function updateStatusUI() {
             </div>
         `).join('');
     }
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
 }
 
 // --- Upload Handler ---
@@ -211,9 +242,6 @@ async function uploadFile(file) {
     formData.append('file', file);
 
     try {
-        // ── Step 1: Send file to server ──────────────────────────────────
-        // Server now returns IMMEDIATELY with a job_id
-        // It does NOT wait for Docling to finish
         const response = await fetch('/api/upload', {
             method: 'POST',
             body: formData
@@ -226,13 +254,10 @@ async function uploadFile(file) {
 
         const result = await response.json();
 
-        // ── Step 2: Check if server rejected the file immediately ────────
-        // e.g. too many pages, wrong type
         if (result.status !== 'processing') {
             throw new Error(result.message || 'Unexpected server response');
         }
 
-        // ── Step 3: File accepted — start polling for background job ─────
         state.activeJobId = result.job_id;
         const fileSizeMb = result.file_size_mb || '?';
         const pageCount = result.page_count ? `${result.page_count} pages` : '';
@@ -244,37 +269,27 @@ async function uploadFile(file) {
         );
 
         showUploadProgress(10, 'File received. Starting Docling processing...');
-
-        // ── Step 4: Poll /api/job/{job_id} every 3 seconds ──────────────
         startJobPolling(result.job_id, result.filename);
 
     } catch (err) {
-        // Upload itself failed (network error, page limit, wrong file type)
         appendSystemMessage(`❌ Upload failed: ${err.message}`);
         resetUploadProgress('Upload failed');
         state.isUploading = false;
     }
 }
 
-// ── Job Polling ──────────────────────────────────────────────────────────────
-// Polls /api/job/{job_id} every 3 seconds
-// Updates the progress bar with live status from the background thread
-// Stops when job is "complete" or "failed"
-
 function startJobPolling(jobId, filename) {
-    // Map progress stage strings to approximate % values for the progress bar
     const progressStages = {
         'Starting Docling conversion...':                      15,
         'Docling conversion complete. Exporting Markdown...':  40,
         'Markdown saved. Extracting image contexts...':        50,
         'Image extraction skipped (large file mode).':         55,
         'Chunking Markdown text...':                           65,
-        'Indexing':                                            80,   // prefix match
+        'Indexing':                                            80,
         'Processing complete.':                               100,
         'Processing failed.':                                 100,
     };
 
-    // Clear any existing poll interval (safety measure)
     if (state.jobPollInterval) {
         clearInterval(state.jobPollInterval);
     }
@@ -283,7 +298,6 @@ function startJobPolling(jobId, filename) {
         try {
             const res = await fetch(`/api/job/${jobId}`);
             if (!res.ok) {
-                // Job endpoint not found — stop polling
                 clearInterval(state.jobPollInterval);
                 state.jobPollInterval = null;
                 appendSystemMessage(`⚠️ Lost track of job ${jobId}. Check server logs.`);
@@ -294,11 +308,9 @@ function startJobPolling(jobId, filename) {
 
             const job = await res.json();
 
-            // ── Update progress bar text ──────────────────────────────
             let progressPct = 10;
             const progressText = job.progress || '';
 
-            // Find matching stage for progress %
             for (const [stage, pct] of Object.entries(progressStages)) {
                 if (progressText.startsWith(stage)) {
                     progressPct = pct;
@@ -306,14 +318,12 @@ function startJobPolling(jobId, filename) {
                 }
             }
 
-            // Show extracting images progress with count if available
             if (progressText.startsWith('Extracting images')) {
                 progressPct = 55;
             }
 
             showUploadProgress(progressPct, progressText);
 
-            // ── Job complete ──────────────────────────────────────────
             if (job.status === 'complete') {
                 clearInterval(state.jobPollInterval);
                 state.jobPollInterval = null;
@@ -326,16 +336,13 @@ function startJobPolling(jobId, filename) {
                     `📦 ${job.chunks_added} chunks added. Total in DB: ${job.total_chunks}.`
                 );
 
-                // Refresh sidebar document list and chunk count
                 fetchStatus();
 
-                // Auto-hide progress bar after 3 seconds
                 setTimeout(() => {
                     resetUploadProgress('');
                 }, 3000);
             }
 
-            // ── Job failed ────────────────────────────────────────────
             if (job.status === 'failed') {
                 clearInterval(state.jobPollInterval);
                 state.jobPollInterval = null;
@@ -351,20 +358,16 @@ function startJobPolling(jobId, filename) {
             }
 
         } catch (pollErr) {
-            // Network error during polling — don't stop, keep trying
             console.warn('Polling error (will retry):', pollErr.message);
             showUploadProgress(null, 'Connection interrupted, retrying...');
         }
 
-    }, 3000); // poll every 3 seconds
+    }, 3000);
 }
-
-// ── Progress Bar Helpers ─────────────────────────────────────────────────────
 
 function showUploadProgress(percent, statusText) {
     els.uploadProgressBar.style.display = 'block';
 
-    // Only update fill width if percent provided (null = keep current)
     if (percent !== null) {
         els.progressFill.style.width = `${percent}%`;
     }
@@ -373,7 +376,6 @@ function showUploadProgress(percent, statusText) {
         els.progressStatus.textContent = statusText;
     }
 
-    // Turn bar red on failure
     if (statusText && (statusText.toLowerCase().includes('fail') || statusText.toLowerCase().includes('error'))) {
         els.progressFill.style.backgroundColor = 'var(--error-color)';
     } else {
@@ -398,7 +400,6 @@ async function handleChatSubmit(e) {
     const queryText = els.chatInput.value.trim();
     if (!queryText || state.isQuerying) return;
 
-    // Warn user if an upload is still in progress
     if (state.isUploading) {
         appendSystemMessage('⏳ A document is still being processed. You can still query existing documents, but the new one may not be ready yet.');
     }
@@ -429,13 +430,26 @@ async function handleChatSubmit(e) {
 
         appendAssistantMessage(data.answer, data.sources, data.cached, data.image_paths);
 
+        // Update Sources Drawer
         if (data.sources && data.sources.length > 0) {
             state.activeSources = data.sources;
             populateSourcesDrawer(data.sources);
             if (els.sourceDrawer.classList.contains('closed')) {
                 els.sourceDrawer.classList.remove('closed');
                 els.toggleSourcesBtn.classList.add('active');
+                els.imagesDrawer.classList.add('closed');
+                els.toggleImagesBtn.classList.remove('active-images');
             }
+        }
+
+        // Update Images Drawer
+        if (data.image_paths && data.image_paths.length > 0) {
+            state.activeImagePaths = data.image_paths;
+            populateImagesDrawer(data.image_paths);
+            updateImagesBtnBadge(data.image_paths.length);
+        } else {
+            state.activeImagePaths = [];
+            updateImagesBtnBadge(0);
         }
 
     } catch (err) {
@@ -457,7 +471,7 @@ function appendUserMessage(text) {
         </div>
     `;
     els.chatMessages.appendChild(msg);
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
     scrollToBottom();
 }
 
@@ -466,12 +480,17 @@ function appendAssistantMessage(text, sources, cached, imagePaths) {
     msg.className = 'message assistant-message';
 
     let metaHtml = '';
-    if (sources && sources.length > 0) {
+    if ((sources && sources.length > 0) || (imagePaths && imagePaths.length > 0)) {
         metaHtml += `<div class="message-meta">`;
         if (cached) {
             metaHtml += `<span class="source-badge" style="color: var(--success-color); border-color: rgba(16, 185, 129, 0.2);" title="Retrieved from Local Request Cache"><i data-lucide="zap"></i> Cached</span>`;
         }
-        metaHtml += `<span class="source-badge" onclick="openSourcesDrawer()"><i data-lucide="book-open"></i> ${sources.length} Sources</span>`;
+        if (sources && sources.length > 0) {
+            metaHtml += `<span class="source-badge" onclick="openSourcesDrawer()"><i data-lucide="book-open"></i> ${sources.length} Sources</span>`;
+        }
+        if (imagePaths && imagePaths.length > 0) {
+            metaHtml += `<span class="source-badge" onclick="openImagesDrawer()" style="color: var(--accent-violet); border-color: rgba(139,92,246,0.2); background: rgba(139,92,246,0.08);"><i data-lucide="image"></i> ${imagePaths.length} Image${imagePaths.length > 1 ? 's' : ''}</span>`;
+        }
         metaHtml += `</div>`;
     }
 
@@ -503,7 +522,7 @@ function appendAssistantMessage(text, sources, cached, imagePaths) {
     `;
 
     els.chatMessages.appendChild(msg);
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
     scrollToBottom();
 }
 
@@ -517,7 +536,7 @@ function appendSystemMessage(text) {
         </div>
     `;
     els.chatMessages.appendChild(msg);
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
     scrollToBottom();
 }
 
@@ -535,7 +554,7 @@ function appendTypingIndicator() {
         </div>
     `;
     els.chatMessages.appendChild(indicator);
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
     return indicator;
 }
 
@@ -545,7 +564,7 @@ function removeTypingIndicator(indicatorEl) {
     }
 }
 
-// --- Context Drawer Management ---
+// --- Sources Drawer ---
 function populateSourcesDrawer(sources) {
     if (!sources || sources.length === 0) {
         els.sourceListContent.innerHTML = `
@@ -554,6 +573,7 @@ function populateSourcesDrawer(sources) {
                 <p>No query context retrieved yet</p>
             </div>
         `;
+        if (typeof lucide !== "undefined") lucide.createIcons();
         return;
     }
 
@@ -574,12 +594,61 @@ function populateSourcesDrawer(sources) {
             </div>
         `;
     }).join('');
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
 }
 
 window.openSourcesDrawer = function () {
+    els.imagesDrawer.classList.add('closed');
+    els.toggleImagesBtn.classList.remove('active-images');
     els.sourceDrawer.classList.remove('closed');
     els.toggleSourcesBtn.classList.add('active');
+};
+
+// --- Images Drawer ---
+function populateImagesDrawer(imagePaths) {
+    if (!imagePaths || imagePaths.length === 0) {
+        els.imagesDrawerContent.innerHTML = `
+            <div class="empty-images-state">
+                <i data-lucide="image-off"></i>
+                <p>No images retrieved for this response</p>
+            </div>
+        `;
+        if (typeof lucide !== "undefined") lucide.createIcons();
+        return;
+    }
+
+    const gridItems = imagePaths.map(path => {
+        let url = path;
+        if (!url.startsWith('/') && !url.startsWith('http')) {
+            url = '/' + url;
+        }
+        return `
+            <div class="drawer-image-card" onclick="openImageModal('${url.replace(/'/g, "\\'")}')">
+                <img src="${escapeHtml(url)}" alt="Retrieved image">
+                <span class="drawer-image-zoom"><i data-lucide="zoom-in"></i></span>
+            </div>
+        `;
+    }).join('');
+
+    els.imagesDrawerContent.innerHTML = `<div class="images-drawer-grid">${gridItems}</div>`;
+    if (typeof lucide !== "undefined") lucide.createIcons();
+}
+
+function updateImagesBtnBadge(count) {
+    if (!els.imagesBtnCount) return;
+    if (count > 0) {
+        els.imagesBtnCount.textContent = count;
+        els.imagesBtnCount.style.display = 'flex';
+    } else {
+        els.imagesBtnCount.style.display = 'none';
+    }
+}
+
+window.openImagesDrawer = function () {
+    els.sourceDrawer.classList.add('closed');
+    els.toggleSourcesBtn.classList.remove('active');
+    els.imagesDrawer.classList.remove('closed');
+    els.toggleImagesBtn.classList.add('active-images');
 };
 
 // --- Modal Utilities ---
@@ -597,11 +666,6 @@ function hideModal() {
     els.alertModal.style.display = 'none';
     activeConfirmCallback = null;
 }
-
-els.modalConfirm.addEventListener('click', () => {
-    if (activeConfirmCallback) activeConfirmCallback();
-    hideModal();
-});
 
 // --- General UI Helpers ---
 function scrollToBottom() {
@@ -630,7 +694,7 @@ window.openImageModal = function (url) {
         </div>
     `;
     document.body.appendChild(overlay);
-    lucide.createIcons();
+    if (typeof lucide !== "undefined") lucide.createIcons();
 
     overlay.addEventListener('click', (e) => {
         if (e.target === overlay || e.target.closest('.lightbox-close')) {
@@ -638,47 +702,3 @@ window.openImageModal = function (url) {
         }
     });
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
