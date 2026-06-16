@@ -416,28 +416,29 @@ async def upload_document(file: UploadFile = File(...)):
     logging.info(f"Received {filename} — {file_size_mb:.1f} MB")
 
     # ── Page count guard ─────────────────────────────────────────────────
+    #not needed, takes alot of load.
     # Uses pypdf (very lightweight) to count pages BEFORE Docling loads
     # This check costs almost zero memory and completes in milliseconds
-    page_count = None
-    try:
-        import pypdf
-        reader = pypdf.PdfReader(io.BytesIO(contents)) #reads it instead of loading the whole file into memory
-        page_count = len(reader.pages)
-        logging.info(f"{filename} has {page_count} pages.")
-        if page_count > 100:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"PDF too large: {page_count} pages. "
-                    f"Maximum allowed is 100 pages. "
-                    f"Please split the document and upload in parts."
-                )
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
+    #page_count = None
+    #try:
+    #    import pypdf
+    #    reader = pypdf.PdfReader(io.BytesIO(contents)) #reads it instead of loading the whole file into memory
+    #    page_count = len(reader.pages)
+    #    logging.info(f"{filename} has {page_count} pages.")
+    #    if page_count > 100:
+    #        raise HTTPException(
+    #            status_code=400,
+    #            detail=(
+    #                f"PDF too large: {page_count} pages. "
+    #                f"Maximum allowed is 100 pages. "
+    #                f"Please split the document and upload in parts."
+    #            )
+    #        )
+    #except HTTPException:
+    #    raise
+    #except Exception as e:
         # pypdf failed to read — let Docling try anyway
-        logging.warning(f"Could not count pages with pypdf: {e}")
+    #    logging.warning(f"Could not count pages with pypdf: {e}")
 
     # ── Save file to disk ────────────────────────────────────────────────
     with file_path.open("wb") as buffer:
@@ -477,7 +478,7 @@ async def upload_document(file: UploadFile = File(...)):
         "total_chunks": collection.count(),
         "error": "",
         "file_size_mb": round(file_size_mb, 1),
-        "page_count": page_count,
+        "page_count":None,
         "mode": mode
     }
 
@@ -485,7 +486,7 @@ async def upload_document(file: UploadFile = File(...)):
     # Docling runs here — completely separate from FastAPI's main thread
     # Even if this thread freezes, the web server stays responsive
     thread = threading.Thread(
-        target=process_pdf_background,
+        target=process_pdf_background, #this fucntion runs in the background
         args=(job_id, file_path, filename, images_scale, generate_images),
         daemon=True  # thread dies automatically if main process exits
     )
@@ -499,7 +500,7 @@ async def upload_document(file: UploadFile = File(...)):
         "job_id": job_id,
         "filename": filename,
         "file_size_mb": round(file_size_mb, 1),
-        "page_count": page_count,
+        "page_count": None,
         "processing_mode": mode,
         "message": "File received. Processing started in background.",
         "poll_url": f"/api/job/{job_id}"
@@ -549,7 +550,7 @@ def clear_chroma():
 
 def tokenize_for_bm25(text: str) -> List[str]:
     """Lowercase, split on non-alphanumeric. Fast and dependency-light."""
-    return re.findall(r'\w+', text.lower())
+    return re.findall(r'\w+', text.lower())#helps in saving in lowercase
 
 
 def reciprocal_rank_fusion(rankings: List[List[int]], k: int = 60) -> List[tuple]:
