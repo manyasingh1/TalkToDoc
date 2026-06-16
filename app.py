@@ -1,3 +1,5 @@
+#dual thread tested on 15-06-26 works well cant parse tables too well and have problems with similairity ranking
+#as of now uses chromadb for embedding and retrieval, uses google gemini 2.5 flash for llm, uses docling for pdf parsing and image extraction and langchain for text splitting and llm interface, uses rank-bm25 for bm25 scoring and rrf for hybrid ranking
 import os
 import io
 import json
@@ -7,6 +9,8 @@ import traceback
 import logging
 import re
 import threading
+import math
+
 
 logging.basicConfig(level=logging.INFO)
 from pathlib import Path
@@ -47,8 +51,21 @@ app.add_middleware(
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 collection = chroma_client.get_or_create_collection(name="documents")
 
+# ─────────────────────────────────────────────
+# Job Tracking — stores status of every upload
+# ─────────────────────────────────────────────
+# Each job looks like:
+# {
+#   "status": "processing" | "complete" | "failed",
+#   "filename": "myfile.pdf",
+#   "progress": "Running Docling conversion...",
+#   "chunks_added": 0,
+#   "total_chunks": 0,
+#   "error": ""           (only on failure)
+# }
 processing_jobs = {}
 
+# Lazy load LLM and Docling to speed up app startup
 llm = None
 converter = None
 
@@ -78,6 +95,10 @@ def get_llm():
 
 
 def get_converter(images_scale: float = 2.0, generate_images: bool = True):
+    """
+    Build a fresh Docling converter with the given settings.
+    NOT cached globally because settings change based on file size.
+    """
     try:
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -124,46 +145,14 @@ def save_cache():
 
 
 # ─────────────────────────────────────────────
-# Decorative Image Filter
-# ─────────────────────────────────────────────
-# Tune these thresholds to taste:
-#   MIN_WIDTH/HEIGHT  — skip images smaller than this in either dimension
-#   MIN_AREA          — skip images whose total pixel area is too small
-#   MAX_ASPECT_RATIO  — skip images shaped like thin strips/dividers/banners
-#
-MIN_WIDTH_PX     = 150      # px
-MIN_HEIGHT_PX    = 150      # px
-MIN_AREA_PX      = 40_000   # px²
-MAX_ASPECT_RATIO = 5.0      # long_side / short_side
-
-def is_decorative(pil_img) -> tuple[bool, str]:
-    """Returns (should_skip, reason). Pure geometry, no API calls."""
-    w, h   = pil_img.size
-    area   = w * h
-    short  = min(w, h)
-    long_  = max(w, h)
-    aspect = long_ / short if short > 0 else 999
-
-    if w < MIN_WIDTH_PX:
-        return True, f"too narrow ({w}px < {MIN_WIDTH_PX}px)"
-    if h < MIN_HEIGHT_PX:
-        return True, f"too short ({h}px < {MIN_HEIGHT_PX}px)"
-    if area < MIN_AREA_PX:
-        return True, f"too small ({area}px² < {MIN_AREA_PX}px²)"
-    if aspect > MAX_ASPECT_RATIO:
-        return True, f"strip/banner aspect ratio ({aspect:.1f} > {MAX_ASPECT_RATIO})"
-    return False, ""
-
-
-# ─────────────────────────────────────────────
 # Request / Response Models
 # ─────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     query: str
     use_cache: bool = True
-    n_results: int = 5
-    chunk_chars: int = 500
+    n_results: int = 10
+    chunk_chars: int = 1000
 
 
 class QueryResponse(BaseModel):
@@ -183,21 +172,26 @@ class StatusResponse(BaseModel):
 
 class JobStatusResponse(BaseModel):
     job_id: str
-    status: str
+    status: str          # "processing" | "complete" | "failed"
     filename: str
     progress: str
     chunks_added: int
     total_chunks: int
-    decorative_skipped: int
     error: str
 
 
 # ─────────────────────────────────────────────
 # Background Processing Function
+# Runs in a separate thread — NEVER blocks FastAPI
 # ─────────────────────────────────────────────
 
 def process_pdf_background(job_id: str, file_path: Path, filename: str,
                             images_scale: float, generate_images: bool):
+    """
+    All the heavy Docling + ChromaDB work happens here,
+    in a background thread completely separate from the main server thread.
+    If this freezes or crashes, FastAPI keeps running normally.
+    """
 
     def update(progress: str):
         processing_jobs[job_id]["progress"] = progress
@@ -206,17 +200,20 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
     try:
         update("Starting Docling conversion...")
 
+        # ── Docling conversion ──────────────────────────────────────────
         conv = get_converter(images_scale=images_scale, generate_images=generate_images)
         result = conv.convert(str(file_path))
         doc = result.document
         update("Docling conversion complete. Exporting Markdown...")
 
+        # ── Markdown export ─────────────────────────────────────────────
         markdown_content = doc.export_to_markdown()
         md_path = DATA_FOLDER / f"{file_path.stem}_output.md"
         with md_path.open("w", encoding="utf-8") as f:
             f.write(markdown_content)
         update("Markdown saved. Extracting image contexts...")
 
+        # ── Image context extraction from Markdown ──────────────────────
         image_contexts_from_markdown = []
         matches = re.findall(r'([^\n]+?)\s*<!-- image -->', markdown_content, re.DOTALL)
         for match_text in matches:
@@ -226,28 +223,17 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
             ctx = ctx.replace('\\', '').strip()
             image_contexts_from_markdown.append(ctx)
 
+        # ── Image extraction ────────────────────────────────────────────
         image_docs_to_index = []
-        decorative_skipped  = 0
         ts = int(time.time())
 
         if generate_images:
-            total_pictures = len(doc.pictures)
-            update(f"Extracting images (found {total_pictures})...")
-
+            update(f"Extracting images (found {len(doc.pictures)})...")
             for i, picture in enumerate(doc.pictures):
                 try:
                     pil_img = picture.image.pil_image
                     if pil_img is None:
                         continue
-
-                    # ── Decorative filter (size + aspect ratio) ────────
-                    skip, reason = is_decorative(pil_img)
-                    if skip:
-                        logging.info(f"[Job {job_id}] Image {i}: skipped — {reason}")
-                        decorative_skipped += 1
-                        continue
-                    # ──────────────────────────────────────────────────
-
                     page = picture.prov[0].page_no if picture.prov else "unknown"
                     img_filename = f"{file_path.stem}_page{page}_img{i}.png"
                     img_path = IMAGES_FOLDER / img_filename
@@ -289,23 +275,20 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
                     })
                 except Exception as img_err:
                     logging.warning(f"[Job {job_id}] Failed to save image {i}: {img_err}")
-
-            logging.info(
-                f"[Job {job_id}] Images: {len(image_docs_to_index)} kept, "
-                f"{decorative_skipped} decorative skipped (out of {total_pictures} total)"
-            )
         else:
             update("Image extraction skipped (large file mode).")
 
+        # ── Text chunking ───────────────────────────────────────────────
         update("Chunking Markdown text...")
         from langchain_text_splitters import MarkdownTextSplitter
-        splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=100)
+        splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = splitter.split_text(markdown_content)
         logging.info(f"[Job {job_id}] Generated {len(chunks)} text chunks.")
 
         if not chunks and not image_docs_to_index:
             raise RuntimeError("No content (text or images) could be extracted from this PDF.")
 
+        # ── ChromaDB indexing ───────────────────────────────────────────
         total_added = 0
 
         if chunks:
@@ -327,27 +310,27 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
             )
             total_added += len(image_docs_to_index)
 
+        # ── Mark job complete ───────────────────────────────────────────
         processing_jobs[job_id].update({
             "status": "complete",
             "progress": "Processing complete.",
             "chunks_added": total_added,
-            "total_chunks": collection.count(),
-            "decorative_skipped": decorative_skipped
+            "total_chunks": collection.count()
         })
-        logging.info(
-            f"[Job {job_id}] Complete. {total_added} items indexed, "
-            f"{decorative_skipped} decorative images skipped."
-        )
+        logging.info(f"[Job {job_id}] Complete. {total_added} items indexed.")
 
     except Exception as e:
         tb = traceback.format_exc()
         logging.error(f"[Job {job_id}] FAILED:\n{tb}")
+
+        # Clean up orphaned file on failure
         try:
             if file_path.exists():
                 file_path.unlink()
                 logging.info(f"[Job {job_id}] Cleaned up orphaned file {file_path.name}")
         except Exception as cleanup_err:
             logging.warning(f"[Job {job_id}] Could not clean up file: {cleanup_err}")
+
         processing_jobs[job_id].update({
             "status": "failed",
             "progress": "Processing failed.",
@@ -360,9 +343,10 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
 # ─────────────────────────────────────────────
 
 @app.get("/api/status", response_model=StatusResponse)
-def get_status():
-    count = collection.count()
-    documents = set()
+def get_status(): 
+#how many chunks loaded, how many documents, is api key active, is llm working
+    count = collection.count()#chunks
+    documents = set()#to prevent documents from repeating
     if count > 0:
         try:
             results = collection.get(include=["metadatas"])
@@ -386,6 +370,10 @@ def get_status():
 
 @app.get("/api/job/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str):
+    """
+    Poll this endpoint to check the progress of a background upload.
+    Frontend calls this every few seconds after receiving a job_id from /api/upload.
+    """
     if job_id not in processing_jobs:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     job = processing_jobs[job_id]
@@ -396,7 +384,6 @@ def get_job_status(job_id: str):
         progress=job.get("progress", ""),
         chunks_added=job.get("chunks_added", 0),
         total_chunks=job.get("total_chunks", 0),
-        decorative_skipped=job.get("decorative_skipped", 0),
         error=job.get("error", "")
     )
 
@@ -407,83 +394,34 @@ def list_jobs():
     return processing_jobs
 
 
-@app.get("/api/images")
-def list_images():
-    try:
-        results = collection.get(include=["metadatas", "documents"])
-        images = []
-        if results and results.get("ids"):
-            for chroma_id, meta, doc in zip(
-                results["ids"], results["metadatas"], results["documents"]
-            ):
-                if meta and meta.get("type") == "image":
-                    img_path = meta.get("image_path", "")
-                    url_path = f"/{img_path}" if img_path and not img_path.startswith("/") else img_path
-                    images.append({
-                        "id": chroma_id,
-                        "image_path": url_path,
-                        "source": meta.get("source", "unknown"),
-                        "page": meta.get("page", "?"),
-                        "chunk_id": meta.get("chunk_id", ""),
-                        "has_ocr": bool(meta.get("ocr_text_present", 0)),
-                        "has_context": bool(meta.get("markdown_context_present", 0)),
-                        "snippet": doc[:120] if doc else ""
-                    })
-        images.sort(key=lambda x: (x["source"], str(x["page"])))
-        return {"images": images, "total": len(images)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list images: {str(e)}")
-
-
-@app.delete("/api/images/{image_id:path}")
-def delete_image(image_id: str):
-    try:
-        result = collection.get(ids=[image_id], include=["metadatas"])
-        if not result or not result.get("ids"):
-            raise HTTPException(status_code=404, detail=f"Image '{image_id}' not found in ChromaDB.")
-
-        meta = result["metadatas"][0] if result["metadatas"] else {}
-        img_path = meta.get("image_path", "")
-
-        collection.delete(ids=[image_id])
-        logging.info(f"Deleted ChromaDB entry: {image_id}")
-
-        if img_path:
-            file_path = BASE_DIR / img_path.lstrip("/")
-            if file_path.exists():
-                file_path.unlink()
-                logging.info(f"Deleted image file: {file_path}")
-            else:
-                logging.warning(f"Image file not found on disk: {file_path}")
-
-        return {
-            "status": "success",
-            "message": "Image deleted from index and disk.",
-            "deleted_id": image_id,
-            "total_chunks": collection.count()
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete image: {str(e)}")
-
-
 @app.post("/api/upload")
 async def upload_document(file: UploadFile = File(...)):
+    """
+    1. Validates file type
+    2. Checks page count (rejects if over limit)
+    3. Saves file to disk
+    4. Determines memory-safe Docling settings based on file size
+    5. Starts background thread for all heavy processing
+    6. Returns job_id IMMEDIATELY — server never freezes
+    """
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     filename = file.filename
-    file_path = DATA_FOLDER / filename
+    file_path = DATA_FOLDER / filename #after checking the file type, save it to folder (data)
 
+    # ── Read file bytes ─────────────────────────────────────────────────
     contents = await file.read()
     file_size_mb = len(contents) / (1024 * 1024)
     logging.info(f"Received {filename} — {file_size_mb:.1f} MB")
 
+    # ── Page count guard ─────────────────────────────────────────────────
+    # Uses pypdf (very lightweight) to count pages BEFORE Docling loads
+    # This check costs almost zero memory and completes in milliseconds
     page_count = None
     try:
         import pypdf
-        reader = pypdf.PdfReader(io.BytesIO(contents))
+        reader = pypdf.PdfReader(io.BytesIO(contents)) #reads it instead of loading the whole file into memory
         page_count = len(reader.pages)
         logging.info(f"{filename} has {page_count} pages.")
         if page_count > 100:
@@ -498,12 +436,22 @@ async def upload_document(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
+        # pypdf failed to read — let Docling try anyway
         logging.warning(f"Could not count pages with pypdf: {e}")
 
+    # ── Save file to disk ────────────────────────────────────────────────
     with file_path.open("wb") as buffer:
         buffer.write(contents)
     logging.info(f"Saved {filename} to {file_path}")
 
+    # ── Determine memory-safe Docling settings ───────────────────────────
+    #
+    # File size  | images_scale | generate_images | Why
+    # -----------+--------------+-----------------+-------------------------
+    # < 10 MB    |     2.0      |      True       | Small file, full quality
+    # 10-20 MB   |     1.0      |      True       | Medium, 75% less memory
+    # > 20 MB    |     1.0      |      False      | Large, images disabled
+    #
     if file_size_mb < 10:
         images_scale = 2.0
         generate_images = True
@@ -519,6 +467,7 @@ async def upload_document(file: UploadFile = File(...)):
 
     logging.info(f"Processing mode: {mode} — scale={images_scale}, images={generate_images}")
 
+    # ── Create job entry ─────────────────────────────────────────────────
     job_id = f"job_{filename.replace('.', '_')}_{int(time.time())}"
     processing_jobs[job_id] = {
         "status": "processing",
@@ -526,20 +475,25 @@ async def upload_document(file: UploadFile = File(...)):
         "progress": "Upload received. Starting background processing...",
         "chunks_added": 0,
         "total_chunks": collection.count(),
-        "decorative_skipped": 0,
         "error": "",
         "file_size_mb": round(file_size_mb, 1),
         "page_count": page_count,
         "mode": mode
     }
 
+    # ── Start background thread ──────────────────────────────────────────
+    # Docling runs here — completely separate from FastAPI's main thread
+    # Even if this thread freezes, the web server stays responsive
     thread = threading.Thread(
         target=process_pdf_background,
         args=(job_id, file_path, filename, images_scale, generate_images),
-        daemon=True
+        daemon=True  # thread dies automatically if main process exits
     )
     thread.start()
 
+    # ── Return immediately ───────────────────────────────────────────────
+    # User gets a response in milliseconds
+    # Frontend polls /api/job/{job_id} to track progress
     return {
         "status": "processing",
         "job_id": job_id,
@@ -589,8 +543,55 @@ def clear_chroma():
         raise HTTPException(status_code=500, detail=f"Failed to clear ChromaDB: {str(e)}")
 
 
+# ─────────────────────────────────────────────
+# BM25 + RRF Hybrid Retrieval Helpers
+# ─────────────────────────────────────────────
+
+def tokenize_for_bm25(text: str) -> List[str]:
+    """Lowercase, split on non-alphanumeric. Fast and dependency-light."""
+    return re.findall(r'\w+', text.lower())
+
+
+def reciprocal_rank_fusion(rankings: List[List[int]], k: int = 60) -> List[tuple]:
+    """
+    Merge multiple ranked lists (each is a list of doc indices) using RRF.
+    Returns [(doc_index, score), ...] sorted by score descending.
+    k=60 is the standard smoothing constant from the original RRF paper.
+    """
+    scores: dict[int, float] = {}
+    for ranking in rankings:
+        for rank, doc_idx in enumerate(ranking):
+            scores[doc_idx] = scores.get(doc_idx, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def bm25_rerank(query: str, documents: List[str]) -> List[int]:
+    """
+    Score `documents` against `query` using BM25.
+    Returns indices sorted best-first.
+    """
+    try:
+        from rank_bm25 import BM25Okapi
+    except ImportError:
+        # rank-bm25 not installed — fall back to original order
+        logging.warning("rank-bm25 not installed. Run: pip install rank-bm25. Falling back to semantic order.")
+        return list(range(len(documents)))
+
+    tokenized_corpus = [tokenize_for_bm25(doc) for doc in documents]
+    tokenized_query = tokenize_for_bm25(query)
+
+    bm25 = BM25Okapi(tokenized_corpus)
+    scores = bm25.get_scores(tokenized_query)
+    return sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+
+
+# ─────────────────────────────────────────────
+# Query Endpoint — Hybrid BM25 + Semantic RAG
+# ─────────────────────────────────────────────
+
 @app.post("/api/query", response_model=QueryResponse)
 def query_rag_api(req: QueryRequest):
+    # ── Cache check ──────────────────────────────────────────────────────
     if req.use_cache and req.query in query_cache:
         cached_val = query_cache[req.query]
         if isinstance(cached_val, dict):
@@ -602,46 +603,13 @@ def query_rag_api(req: QueryRequest):
                 image_paths=cached_val.get("image_paths", [])
             )
         else:
-            try:
-                chroma_res = collection.query(
-                    query_texts=[req.query],
-                    n_results=req.n_results,
-                    include=["documents", "metadatas"]
-                )
-                sources = []
-                image_paths = []
-                if chroma_res and chroma_res["documents"] and chroma_res["documents"][0]:
-                    for doc, meta in zip(chroma_res["documents"][0], chroma_res["metadatas"][0]):
-                        is_image = meta.get("type") == "image"
-                        img_path = meta.get("image_path", "")
-                        if is_image and img_path:
-                            url_path = f"/{img_path}" if not img_path.startswith("/") else img_path
-                            image_paths.append(url_path)
-                            sources.append({
-                                "source": meta.get("source", "unknown"),
-                                "chunk_id": meta.get("chunk_id", -1),
-                                "type": "image",
-                                "image_path": url_path,
-                                "snippet": doc[:req.chunk_chars]
-                            })
-                        else:
-                            sources.append({
-                                "source": meta.get("source", "unknown"),
-                                "chunk_id": meta.get("chunk_id", -1),
-                                "type": "text",
-                                "snippet": doc[:req.chunk_chars]
-                            })
-            except Exception as e:
-                print(f"Error fetching sources for cached query: {e}")
-                sources = []
-                image_paths = []
-
+            # Legacy string-only cache entry
             return QueryResponse(
                 query=req.query,
                 answer=cached_val,
                 cached=True,
-                sources=sources,
-                image_paths=image_paths
+                sources=[],
+                image_paths=[]
             )
 
     llm_instance = get_llm()
@@ -652,16 +620,22 @@ def query_rag_api(req: QueryRequest):
     if count == 0:
         raise HTTPException(status_code=400, detail="No documents indexed in ChromaDB. Please upload a PDF first.")
 
+    # ── Rate limiting ────────────────────────────────────────────────────
     time_since_last_call = time.time() - last_api_call["time"]
     min_delay = 4.0
     if time_since_last_call < min_delay:
-        wait_time = min_delay - time_since_last_call
-        time.sleep(wait_time)
+        time.sleep(min_delay - time_since_last_call)
 
     try:
+        # ── Step 1: Semantic retrieval (wider candidate pool for reranking) ──
+        # Fetch 3x candidates so BM25 has enough to rerank meaningfully.
+        # Final result is still trimmed to req.n_results.
+        candidate_multiplier = 3
+        n_candidates = min(req.n_results * candidate_multiplier, count) #capped at total count
+#what embeds the query, gets similar results with doc and metadata
         chroma_res = collection.query(
             query_texts=[req.query],
-            n_results=req.n_results,
+            n_results=n_candidates,
             include=["documents", "metadatas"]
         )
 
@@ -674,9 +648,29 @@ def query_rag_api(req: QueryRequest):
                 image_paths=[]
             )
 
-        retrieved_docs = chroma_res["documents"][0]
-        retrieved_metas = chroma_res["metadatas"][0]
+        candidate_docs = chroma_res["documents"][0]
+        candidate_metas = chroma_res["metadatas"][0]
 
+        # ── Step 2: BM25 reranking over the candidate pool ──────────────
+        # semantic_order  = [0, 1, 2, ...] — ChromaDB already returns best-first
+        # bm25_order      = indices sorted by BM25 score
+       
+        semantic_order = list(range(len(candidate_docs)))
+        bm25_order = bm25_rerank(req.query, candidate_docs)
+        fused = reciprocal_rank_fusion([semantic_order, bm25_order]) # RRF blends both to produce final ranking
+
+        # Take top n_results after fusion
+        top_indices = [idx for idx, _score in fused[:req.n_results]]
+
+        retrieved_docs = [candidate_docs[i] for i in top_indices]
+        retrieved_metas = [candidate_metas[i] for i in top_indices]
+
+        logging.info(
+            f"[Query] '{req.query[:60]}' — "
+            f"{len(candidate_docs)} candidates → {len(retrieved_docs)} after BM25+RRF"
+        )
+
+        # ── Step 3: Build sources + image list ───────────────────────────
         sources = []
         image_paths = []
         for doc, meta in zip(retrieved_docs, retrieved_metas):
@@ -700,11 +694,11 @@ def query_rag_api(req: QueryRequest):
                     "snippet": doc[:req.chunk_chars]
                 })
 
+        # ── Step 4: LLM call ─────────────────────────────────────────────
         context = "\n\n---\n\n".join(
             f"Source: {meta.get('source', 'unknown')}, Type: {meta.get('type', 'text')}\n{doc[:req.chunk_chars]}"
             for doc, meta in zip(retrieved_docs, retrieved_metas)
         )
-
         prompt = f"Answer based on this context only.\nQuery: {req.query}\nContext: {context}\nAnswer:"
 
         response = llm_instance.invoke(prompt)
@@ -725,10 +719,10 @@ def query_rag_api(req: QueryRequest):
             sources=sources,
             image_paths=image_paths
         )
-    except Exception as e:
-        print(f"Error querying RAG: {e}")
-        raise HTTPException(status_code=500, detail=f"Error executing RAG query: {str(e)}")
 
+    except Exception as e:
+        logging.error(f"Error querying RAG: {e}")
+        raise HTTPException(status_code=500, detail=f"Error executing RAG query: {str(e)}")
 
 # Mount Static Files (at the end so API routes take precedence)
 static_dir = BASE_DIR / "static"
@@ -739,3 +733,4 @@ app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+
