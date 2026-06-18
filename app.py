@@ -1,4 +1,4 @@
-#dual thread tested on 15-06-26 works well cant parse tables too well and have problems with similairity ranking
+#dual thread tested on 15-06-26 works well
 #as of now uses chromadb for embedding and retrieval, uses google gemini 2.5 flash for llm, uses docling for pdf parsing and image extraction and langchain for text splitting and llm interface, uses rank-bm25 for bm25 scoring and rrf for hybrid ranking
 import os
 import io
@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import math
-
+import tempfile
 
 logging.basicConfig(level=logging.INFO)
 from pathlib import Path
@@ -105,9 +105,10 @@ def get_converter(images_scale: float = 2.0, generate_images: bool = True):
         from docling.datamodel.base_models import InputFormat
 
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = False
+        pipeline_options.do_ocr = True
         pipeline_options.generate_picture_images = generate_images
         pipeline_options.images_scale = images_scale
+        pipeline_options.document_timeout=600.0
 
         conv = DocumentConverter(
             format_options={
@@ -126,6 +127,7 @@ def get_converter(images_scale: float = 2.0, generate_images: bool = True):
 # Cache setup
 CACHE_FILE = BASE_DIR / "query_cache.json"
 query_cache = {}
+cache_lock=threading.Lock()
 if CACHE_FILE.exists():
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -137,11 +139,30 @@ last_api_call = {"time": 0}
 
 
 def save_cache():
+    #fd: file descriptor an integer used to identify/track an open file in os
+    #mkstemp:temp file, opens file at os?
+    #temp_path: path of that file in hd
+    fd,temp_path =tempfile.mkstemp(dir=BASE_DIR, prefix="cache_tmp_", suffix=".json")#instead of opening the cache file, we create a temp file
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(query_cache, f, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:#cannot use open() here instead os.fdopen,,, with() makes sure the file is automatically closed once done
+            json.dump(query_cache,f,indent=2)#python directory is changed to json(still sitting in temp file) 
+            f.flush() #"flushes" program buffer to os buffer
+            os.fsync(f.fileno())#copy data from the os buffer to disk
+
+        os.replace(temp_path,CACHE_FILE)#update
+
     except Exception as e:
         print(f"Failed to save cache: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        #with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        #    json.dump(query_cache, f, indent=2) 
+        #    #can cause overwriting and race condition
+    #except Exception as e:
+    #    print(f"Failed to save cache: {e}")
+
+
 
 
 # ─────────────────────────────────────────────
@@ -215,7 +236,12 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
 
         # ── Image context extraction from Markdown ──────────────────────
         image_contexts_from_markdown = []
-        matches = re.findall(r'([^\n]+?)\s*<!-- image -->', markdown_content, re.DOTALL)
+        #just takes the value just above the image tag
+        #matches = re.findall(r'([^\n]+?)\s*<!-- image -->', markdown_content, re.DOTALL)
+        #takes 1 to 200 characters above the image tag
+        matches = re.findall(r'([\s\S]{0,200}?)\s*<!-- image -->', markdown_content, re.DOTALL)
+        #to match 3 lines above it
+        #matches = re.findall(r'((?:[^\n]*\n?){0,2}[^\n]*?)\s*<!-- image -->',markdown_content)
         for match_text in matches:
             ctx = match_text.strip()
             ctx = re.sub(r'#+\s*', '', ctx)
@@ -225,7 +251,7 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
 
         # ── Image extraction ────────────────────────────────────────────
         image_docs_to_index = []
-        ts = int(time.time())
+        ts = int(time.time())#for guaranteed uniqueness 
 
         if generate_images:
             update(f"Extracting images (found {len(doc.pictures)})...")
@@ -252,9 +278,9 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
                     image_document_content = f"Image {i} from page {page}. "
                     if ocr_text:
                         image_document_content += f"OCR text: {ocr_text}. "
-                    elif markdown_context:
+                    if markdown_context:
                         image_document_content += f"Context from document: {markdown_context}. "
-                    else:
+                    if not ocr_text and not markdown_context:
                         image_document_content += "No readable text or explicit context found in this image. "
 
                     db_img_path = f"extracted_images/{img_filename}"
@@ -262,7 +288,7 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
 
                     image_docs_to_index.append({
                         "id": f"{filename}_image_{i}_{page}_{ts}",
-                        "document": image_document_content,
+                        "document": image_document_content,#"context from doc" or "OCR:text"
                         "metadata": {
                             "source": filename,
                             "type": "image",
@@ -305,7 +331,7 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
             update(f"Indexing {len(image_docs_to_index)} image documents into ChromaDB...")
             collection.add(
                 ids=[d["id"] for d in image_docs_to_index],
-                documents=[d["document"] for d in image_docs_to_index],
+                documents=[d["document"] for d in image_docs_to_index],#"context from doc" or "OCR:text"
                 metadatas=[d["metadata"] for d in image_docs_to_index]
             )
             total_added += len(image_docs_to_index)
@@ -319,12 +345,12 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
         })
         logging.info(f"[Job {job_id}] Complete. {total_added} items indexed.")
 
-    except Exception as e:
+    except Exception as e:#if incase the process fails in the middle of docling parsing/chunking, the file is removed
         tb = traceback.format_exc()
         logging.error(f"[Job {job_id}] FAILED:\n{tb}")
 
         # Clean up orphaned file on failure
-        try:
+        try: 
             if file_path.exists():
                 file_path.unlink()
                 logging.info(f"[Job {job_id}] Cleaned up orphaned file {file_path.name}")
@@ -441,7 +467,7 @@ async def upload_document(file: UploadFile = File(...)):
     #    logging.warning(f"Could not count pages with pypdf: {e}")
 
     # ── Save file to disk ────────────────────────────────────────────────
-    with file_path.open("wb") as buffer:
+    with file_path.open("wb") as buffer:#write exact raw bites to disk
         buffer.write(contents)
     logging.info(f"Saved {filename} to {file_path}")
 
@@ -469,7 +495,7 @@ async def upload_document(file: UploadFile = File(...)):
     logging.info(f"Processing mode: {mode} — scale={images_scale}, images={generate_images}")
 
     # ── Create job entry ─────────────────────────────────────────────────
-    job_id = f"job_{filename.replace('.', '_')}_{int(time.time())}"
+    job_id = f"job_{filename.replace('.', '_')}_{int(time.time())}" #time.time() acts as a simple mechanism to guarantee uniqueness 
     processing_jobs[job_id] = {
         "status": "processing",
         "filename": filename,
@@ -510,7 +536,7 @@ async def upload_document(file: UploadFile = File(...)):
 @app.post("/api/clear-docs")
 def clear_documents():
     try:
-        for item in DATA_FOLDER.glob("*"):
+        for item in DATA_FOLDER.glob("*"):#glob for file matching
             if item.is_file():
                 item.unlink()
         for item in IMAGES_FOLDER.glob("*"):
@@ -528,7 +554,7 @@ def clear_documents():
 def clear_chroma():
     global query_cache
     try:
-        existing = collection.get()
+        existing = collection.get() #get() for keyword and value
         deleted_count = 0
         if existing and existing["ids"]:
             deleted_count = len(existing["ids"])
@@ -554,11 +580,11 @@ def tokenize_for_bm25(text: str) -> List[str]:
 
 
 def reciprocal_rank_fusion(rankings: List[List[int]], k: int = 60) -> List[tuple]:
-    """
-    Merge multiple ranked lists (each is a list of doc indices) using RRF.
-    Returns [(doc_index, score), ...] sorted by score descending.
-    k=60 is the standard smoothing constant from the original RRF paper.
-    """
+    
+    #Merge multiple ranked lists (each is a list of doc indices) using RRF.
+    #Returns [(doc_index, score), ...] sorted by score descending.
+    #k=60 is the standard smoothing constant from the original RRF paper.
+    
     scores: dict[int, float] = {}
     for ranking in rankings:
         for rank, doc_idx in enumerate(ranking):
@@ -568,7 +594,7 @@ def reciprocal_rank_fusion(rankings: List[List[int]], k: int = 60) -> List[tuple
 
 def bm25_rerank(query: str, documents: List[str]) -> List[int]:
     """
-    Score `documents` against `query` using BM25.
+    Score `documents` against `query` using BM25..
     Returns indices sorted best-first.
     """
     try:
@@ -706,12 +732,15 @@ def query_rag_api(req: QueryRequest):
         answer = response.content if hasattr(response, 'content') else str(response)
 
         last_api_call["time"] = time.time()
-        query_cache[req.query] = {
-            "answer": answer,
-            "sources": sources,
-            "image_paths": image_paths
-        }
-        save_cache()
+
+        #adding a cache lock, so that only one thread update, let others wait
+        with cache_lock:
+            query_cache[req.query] = {
+                "answer": answer,
+                "sources": sources,
+                "image_paths": image_paths
+            }
+            save_cache()#fucntion called that updates cache to disk
 
         return QueryResponse(
             query=req.query,
