@@ -1,4 +1,5 @@
-#dual thread tested on 15-06-26 works well
+#19-06-26 multithread, cache lock and atomic write 
+
 #as of now uses chromadb for embedding and retrieval, uses google gemini 2.5 flash for llm, uses docling for pdf parsing and image extraction and langchain for text splitting and llm interface, uses rank-bm25 for bm25 scoring and rrf for hybrid ranking
 import os
 import io
@@ -20,6 +21,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from PIL import Image
 import chromadb
 from dotenv import load_dotenv
 
@@ -49,7 +51,11 @@ app.add_middleware(
 
 # Setup ChromaDB
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-collection = chroma_client.get_or_create_collection(name="documents")
+# collection = chroma_client.get_or_create_collection(name="documents")
+collection = chroma_client.get_or_create_collection(
+    name="documents",
+    metadata={"hnsw:space": "cosine"}  
+)
 
 # ─────────────────────────────────────────────
 # Job Tracking — stores status of every upload
@@ -105,10 +111,10 @@ def get_converter(images_scale: float = 2.0, generate_images: bool = True):
         from docling.datamodel.base_models import InputFormat
 
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
+        pipeline_options.do_ocr = False
         pipeline_options.generate_picture_images = generate_images
         pipeline_options.images_scale = images_scale
-        pipeline_options.document_timeout=600.0
+        # pipeline_options.document_timeout=600.0
 
         conv = DocumentConverter(
             format_options={
@@ -247,7 +253,7 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
             ctx = re.sub(r'#+\s*', '', ctx)
             ctx = re.sub(r'\s*\|.*', '', ctx)
             ctx = ctx.replace('\\', '').strip()
-            image_contexts_from_markdown.append(ctx)
+            image_contexts_from_markdown.append(ctx)#remove # and | and space from the text taken 
 
         # ── Image extraction ────────────────────────────────────────────
         image_docs_to_index = []
@@ -260,7 +266,11 @@ def process_pdf_background(job_id: str, file_path: Path, filename: str,
                     pil_img = picture.image.pil_image
                     if pil_img is None:
                         continue
-                    page = picture.prov[0].page_no if picture.prov else "unknown"
+                    pil_img = pil_img.resize(
+                            (pil_img.width // 2, pil_img.height // 2),
+                            Image.Resampling.LANCZOS  # covolution filter
+                        )
+                    page = picture.prov[0].page_no if picture.prov else "unknown" #prov: list of the locations an image is found at multiple places(comparing img obj)
                     img_filename = f"{file_path.stem}_page{page}_img{i}.png"
                     img_path = IMAGES_FOLDER / img_filename
                     pil_img.save(img_path)
@@ -482,7 +492,7 @@ async def upload_document(file: UploadFile = File(...)):
     if file_size_mb < 10:
         images_scale = 2.0
         generate_images = True
-        mode = "full quality"
+        mode = "reduced quality"
     elif file_size_mb < 20:
         images_scale = 1.0
         generate_images = True
@@ -491,7 +501,9 @@ async def upload_document(file: UploadFile = File(...)):
         images_scale = 1.0
         generate_images = False
         mode = "text only (large file)"
-
+    #mode="reduced quality"
+    #images_scale=1.0
+    #generate_images=False
     logging.info(f"Processing mode: {mode} — scale={images_scale}, images={generate_images}")
 
     # ── Create job entry ─────────────────────────────────────────────────
@@ -658,12 +670,12 @@ def query_rag_api(req: QueryRequest):
         # Fetch 3x candidates so BM25 has enough to rerank meaningfully.
         # Final result is still trimmed to req.n_results.
         candidate_multiplier = 3
-        n_candidates = min(req.n_results * candidate_multiplier, count) #capped at total count
+        n_candidates = min(req.n_results * candidate_multiplier, count) #capped at total count so no overflow
 #what embeds the query, gets similar results with doc and metadata
         chroma_res = collection.query(
             query_texts=[req.query],
             n_results=n_candidates,
-            include=["documents", "metadatas"]
+            include=["documents", "metadatas"] #to return the text than the dict scores
         )
 
         if not chroma_res or not chroma_res["documents"] or not chroma_res["documents"][0]:
@@ -674,9 +686,9 @@ def query_rag_api(req: QueryRequest):
                 sources=[],
                 image_paths=[]
             )
-
-        candidate_docs = chroma_res["documents"][0]
-        candidate_metas = chroma_res["metadatas"][0]
+#api only supports one question at a time so [0] 
+        candidate_docs = chroma_res["documents"][0]#text chunks
+        candidate_metas = chroma_res["metadatas"][0]#meta data for questions
 
         # ── Step 2: BM25 reranking over the candidate pool ──────────────
         # semantic_order  = [0, 1, 2, ...] — ChromaDB already returns best-first
